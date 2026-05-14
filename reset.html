@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>איפוס המערכת</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 40px 20px;
+            text-align: center;
+            background: #F0F0EF;
+            color: #2D2D2D;
+            margin: 0;
+        }
+        h1 { color: #009999; margin-bottom: 8px; }
+        .subtitle { color: #7A7A7A; font-size: 14px; margin-bottom: 24px; }
+        .status {
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            font-size: 15px;
+            line-height: 1.6;
+            max-width: 400px;
+            margin: 0 auto;
+        }
+        .ok { color: #27AE60; }
+        .err { color: #E74C3C; }
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #ddd;
+            border-top-color: #009999;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-left: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <h1>🔧 איפוס המערכת</h1>
+    <div class="subtitle">מנקה Service Workers ומטמון, ופותח את הגרסה החדשה</div>
+    <div class="status" id="status">מתחילה...<span class="spinner"></span></div>
+    <script>
+        (async () => {
+            const status = document.getElementById('status');
+            const log = (line, cls) => {
+                const div = document.createElement('div');
+                div.textContent = line;
+                if (cls) div.className = cls;
+                status.appendChild(div);
+            };
+            try {
+                status.innerHTML = '';
+
+                if ('serviceWorker' in navigator) {
+                    const regs = await navigator.serviceWorker.getRegistrations();
+                    for (const r of regs) await r.unregister();
+                    log(`✓ ${regs.length} Service Workers הוסרו`, 'ok');
+                } else {
+                    log('— אין תמיכה ב-Service Workers בדפדפן זה');
+                }
+
+                if (window.caches) {
+                    const keys = await caches.keys();
+                    await Promise.all(keys.map(k => caches.delete(k)));
+                    log(`✓ ${keys.length} caches נמחקו`, 'ok');
+                }
+
+                log('הנתונים שלך (משימות, קטגוריות) נשמרו ב-localStorage ולא נמחקו ✓', 'ok');
+                log('פותח את הגרסה החדשה בעוד שנייה...');
+
+                setTimeout(() => {
+                    location.replace('./index.html?v=' + Date.now());
+                }, 2000);
+            } catch (e) {
+                log('שגיאה: ' + e.message, 'err');
+                log('נסי לסגור ולפתוח שוב את הדף', 'err');
+            }
+        })();
+    </script>
+</body>
+</html>

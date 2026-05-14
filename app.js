@@ -3,7 +3,7 @@
    ============================================================ */
 
 // ===== Constants =====
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.2';
 const STORAGE_KEY = 'taskmanager_v1';
 const ALERTED_KEY = 'taskmanager_alerted_v1';
 const SAFETY_BACKUP_KEY = 'taskmanager_safety_backup';
@@ -1339,45 +1339,26 @@ function snapshotBackup() {
 
 async function checkForUpdate() {
     snapshotBackup();
-    showToast('🔄 הנתונים גובו · בודק עדכון…');
-
-    if (!('serviceWorker' in navigator)) {
-        showToast('עדכון אוטומטי לא נתמך בדפדפן זה');
-        return;
-    }
+    showToast('🔄 הנתונים גובו · מוריד גרסה חדשה…');
 
     try {
-        const reg = await navigator.serviceWorker.getRegistration();
-        if (!reg) {
-            showToast('שירות לא רשום — רענני את הדף');
-            return;
+        if ('serviceWorker' in navigator) {
+            const reg = await navigator.serviceWorker.getRegistration();
+            if (reg) {
+                await reg.update();
+                if (reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+            }
         }
-
-        let foundNew = false;
-        const onUpdateFound = () => {
-            foundNew = true;
-            const newSW = reg.installing || reg.waiting;
-            if (!newSW) return;
-            const handleState = () => {
-                if (newSW.state === 'installed') {
-                    showToast('✓ עדכון מוכן! טוען מחדש…');
-                    setTimeout(() => location.reload(), 1500);
-                }
-            };
-            newSW.addEventListener('statechange', handleState);
-            handleState();
-        };
-        reg.addEventListener('updatefound', onUpdateFound, { once: true });
-
-        await reg.update();
-
-        setTimeout(() => {
-            if (!foundNew) showToast('הגרסה שלך עדכנית ✓');
-        }, 3000);
     } catch (e) {
-        console.error(e);
-        showToast('שגיאה בבדיקת עדכון');
+        console.warn('SW update failed', e);
     }
+
+    // Force a fresh load with cache-busting query string —
+    // this bypasses any stale HTTP cache that might be holding old code.
+    setTimeout(() => {
+        const url = location.pathname + '?v=' + Date.now();
+        location.replace(url);
+    }, 1200);
 }
 
 function handleClearAll() {
