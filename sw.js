@@ -1,5 +1,5 @@
 /* Service Worker — network-first for HTML/JS/CSS so updates roll out immediately. */
-const CACHE = 'taskmanager-v1';
+const CACHE = 'taskmanager-v4';
 const ASSETS = [
     './',
     './index.html',

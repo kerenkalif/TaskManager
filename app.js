@@ -3,10 +3,16 @@
    ============================================================ */
 
 // ===== Constants =====
+const APP_VERSION = '1.2.0';
 const STORAGE_KEY = 'taskmanager_v1';
+const ALERTED_KEY = 'taskmanager_alerted_v1';
+const SAFETY_BACKUP_KEY = 'taskmanager_safety_backup';
 const DEFAULT_TIME = '09:00';
 const OVERDUE_LOOKBACK_DAYS = 14;
-const FUTURE_LOOKAHEAD_DAYS = 30;
+const FUTURE_LOOKAHEAD_DAYS = 90;
+const DEFAULT_RECURRENCE_COUNT = 10;
+const MAX_RECURRENCE_COUNT = 365;
+const REMINDER_SCHEDULE_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 const CATEGORY_COLORS = [
     '#009999', // brand teal
@@ -34,9 +40,10 @@ let state = {
     categories: [],
     tasks: [],
     completions: {}, // { 'taskId_YYYY-MM-DD': { doneAt: ISOstring } }
+    settings: { remindersEnabled: true },
     ui: {
         view: 'main',
-        categoryFilter: 'all',
+        categoryFilter: [], // empty array = no filter (shows all)
         statusFilter: 'all', // 'all' | 'pending' | 'done' (for all-tasks view)
         futureExpanded: false,
         overdueExpanded: true
@@ -90,6 +97,7 @@ function loadState() {
         state.categories = data.categories || [...DEFAULT_CATEGORIES];
         state.tasks = data.tasks || [];
         state.completions = data.completions || {};
+        state.settings = Object.assign({ remindersEnabled: true }, data.settings || {});
     } catch (e) {
         console.error('Failed to load state', e);
         state.categories = [...DEFAULT_CATEGORIES];
@@ -102,9 +110,11 @@ function saveState() {
     const data = {
         categories: state.categories,
         tasks: state.tasks,
-        completions: state.completions
+        completions: state.completions,
+        settings: state.settings
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    scheduleReminders();
 }
 
 // ===== ID helper =====
@@ -113,30 +123,43 @@ function newId(prefix) {
 }
 
 // ===== Recurring task expansion =====
-// Returns true if a recurring task should occur on a given date
+// Pure rule match — does the recurrence pattern hit this date? (Ignores count + exceptions.)
 function recurrenceHits(task, dateStr) {
     if (!task.recurrence) return dateStr === task.dueDate;
     if (dateStr < task.dueDate) return false;
-    if (task.until && dateStr > task.until) return false;
-
     const r = task.recurrence;
-    if (r.type === 'daily') {
-        return true;
-    }
+    if (r.type === 'daily') return true;
     if (r.type === 'weekly') {
         const dow = dayOfWeek(dateStr);
-        // if weekdays not specified, use the dueDate's day of week
         const days = (r.weekdays && r.weekdays.length > 0)
             ? r.weekdays
             : [dayOfWeek(task.dueDate)];
         return days.includes(dow);
     }
     if (r.type === 'monthly') {
-        const targetDay = parseDate(task.dueDate).getDate();
-        const thisDay = parseDate(dateStr).getDate();
-        return targetDay === thisDay;
+        return parseDate(task.dueDate).getDate() === parseDate(dateStr).getDate();
     }
     return false;
+}
+
+// All actual occurrence dates for a task, honoring count limit and exceptions.
+function getTaskOccurrenceDates(task) {
+    if (!task.recurrence) return [task.dueDate];
+    const maxOccurrences = task.recurrence.count || DEFAULT_RECURRENCE_COUNT;
+    const exceptions = new Set(task.exceptions || []);
+    const out = [];
+    let date = task.dueDate;
+    let matched = 0;
+    let safety = 0;
+    while (matched < maxOccurrences && safety < 5000) {
+        if (recurrenceHits(task, date)) {
+            matched++;
+            if (!exceptions.has(date)) out.push(date);
+        }
+        date = addDays(date, 1);
+        safety++;
+    }
+    return out;
 }
 
 // Returns the "occurrence" virtual object for a task on a given date
@@ -174,18 +197,10 @@ function occurrenceFor(task, dateStr) {
 function getOccurrencesInRange(fromDate, toDate) {
     const out = [];
     for (const task of state.tasks) {
-        if (task.recurrence) {
-            // expand
-            let d = fromDate < task.dueDate ? task.dueDate : fromDate;
-            while (d <= toDate) {
-                if (recurrenceHits(task, d)) {
-                    out.push(occurrenceFor(task, d));
-                }
-                d = addDays(d, 1);
-            }
-        } else {
-            if (task.dueDate >= fromDate && task.dueDate <= toDate) {
-                out.push(occurrenceFor(task, task.dueDate));
+        const dates = getTaskOccurrenceDates(task);
+        for (const d of dates) {
+            if (d >= fromDate && d <= toDate) {
+                out.push(occurrenceFor(task, d));
             }
         }
     }
@@ -234,8 +249,21 @@ function setOccurrenceDone(occ, done) {
 
 // ===== Filtering by category =====
 function filterByCategory(occurrences) {
-    if (state.ui.categoryFilter === 'all') return occurrences;
-    return occurrences.filter(o => o.categoryId === state.ui.categoryFilter);
+    const filters = state.ui.categoryFilter || [];
+    if (filters.length === 0) return occurrences;
+    return occurrences.filter(o => filters.includes(o.categoryId));
+}
+
+function toggleCategoryFilter(catId) {
+    if (catId === 'all') {
+        state.ui.categoryFilter = [];
+        return;
+    }
+    const filters = state.ui.categoryFilter || [];
+    const idx = filters.indexOf(catId);
+    if (idx >= 0) filters.splice(idx, 1);
+    else filters.push(catId);
+    state.ui.categoryFilter = filters;
 }
 
 // ===== Sort helpers =====
@@ -290,12 +318,13 @@ function renderHeader() {
 
 function renderFilterChips() {
     if (state.ui.view !== 'main') return '';
+    const filters = state.ui.categoryFilter || [];
+    const allActive = filters.length === 0;
     let html = '<div class="filter-chips">';
-    const allActive = state.ui.categoryFilter === 'all';
     html += `<button class="chip ${allActive ? 'active' : ''}" data-action="filter" data-cat="all">
         <span class="chip-dot"></span>הכל</button>`;
     for (const cat of state.categories) {
-        const active = state.ui.categoryFilter === cat.id;
+        const active = filters.includes(cat.id);
         html += `<button class="chip ${active ? 'active' : ''}" data-action="filter" data-cat="${cat.id}">
             <span class="chip-dot" style="background:${cat.color}"></span>${escapeHtml(cat.name)}</button>`;
     }
@@ -436,10 +465,10 @@ function renderAllTasksView() {
             </div>
         </div>
         <div class="filter-chips" style="margin: -16px -16px 16px; padding: 12px 16px;">
-            <button class="chip ${state.ui.categoryFilter === 'all' ? 'active' : ''}" data-action="filter" data-cat="all">
+            <button class="chip ${(state.ui.categoryFilter || []).length === 0 ? 'active' : ''}" data-action="filter" data-cat="all">
                 <span class="chip-dot"></span>הכל</button>
             ${state.categories.map(c => `
-                <button class="chip ${state.ui.categoryFilter === c.id ? 'active' : ''}" data-action="filter" data-cat="${c.id}">
+                <button class="chip ${(state.ui.categoryFilter || []).includes(c.id) ? 'active' : ''}" data-action="filter" data-cat="${c.id}">
                     <span class="chip-dot" style="background:${c.color}"></span>${escapeHtml(c.name)}</button>
             `).join('')}
         </div>
@@ -483,6 +512,14 @@ function renderSettingsView() {
     const taskCount = state.tasks.length;
     const catCount = state.categories.length;
     const compCount = Object.keys(state.completions).length;
+    const remindersOn = !!state.settings.remindersEnabled;
+    const permState = ('Notification' in window) ? Notification.permission : 'unsupported';
+    let permLabel = '';
+    if (permState === 'granted') permLabel = '✓ התראות מערכת מאושרות';
+    else if (permState === 'denied') permLabel = '⚠️ התראות מערכת חסומות בדפדפן';
+    else if (permState === 'default') permLabel = 'ℹ️ הפעלי כדי לקבל אישור לתזכורות';
+    else permLabel = 'התראות מערכת לא נתמכות בדפדפן זה';
+
     return `
         <div class="settings-item">
             <div class="settings-item-label">
@@ -490,27 +527,29 @@ function renderSettingsView() {
                 <div class="settings-item-desc">${taskCount} משימות · ${catCount} קטגוריות · ${compCount} ביצועים</div>
             </div>
         </div>
-        <div class="settings-item" data-action="export">
+
+        <div class="settings-item">
             <div class="settings-item-label">
-                <div class="settings-item-title">💾 גיבוי הנתונים</div>
-                <div class="settings-item-desc">הורד קובץ JSON עם כל המשימות והקטגוריות</div>
+                <div class="settings-item-title">🔔 תזכורות וצליל</div>
+                <div class="settings-item-desc">${permLabel}</div>
             </div>
-            <button class="icon-btn">⬇️</button>
+            <div class="switch ${remindersOn ? 'on' : ''}" data-action="toggle-reminders"></div>
         </div>
-        <div class="settings-item" data-action="import">
+
+        <div class="settings-item" data-action="check-update">
             <div class="settings-item-label">
-                <div class="settings-item-title">📥 שחזור מגיבוי</div>
-                <div class="settings-item-desc">העלה קובץ גיבוי קודם</div>
+                <div class="settings-item-title">🔄 עדכון גרסה</div>
+                <div class="settings-item-desc">גרסה נוכחית: ${APP_VERSION} · לחיצה תגבה את הנתונים ותבדוק עדכון</div>
             </div>
-            <button class="icon-btn">⬆️</button>
+            <button class="icon-btn">↻</button>
         </div>
+
         <div class="settings-item" data-action="clear-all" style="border:1px solid var(--danger-bg);">
             <div class="settings-item-label">
                 <div class="settings-item-title" style="color:var(--danger)">🗑️ מחק את כל הנתונים</div>
                 <div class="settings-item-desc">פעולה זו אינה הפיכה</div>
             </div>
         </div>
-        <input type="file" id="import-file" accept="application/json" style="display:none">
     `;
 }
 
@@ -550,11 +589,11 @@ function handleAppClick(e) {
     switch (action) {
         case 'nav':
             state.ui.view = el.dataset.view;
-            state.ui.categoryFilter = 'all';
+            state.ui.categoryFilter = [];
             render();
             break;
         case 'filter':
-            state.ui.categoryFilter = el.dataset.cat;
+            toggleCategoryFilter(el.dataset.cat);
             render();
             break;
         case 'status':
@@ -583,11 +622,11 @@ function handleAppClick(e) {
         case 'delete-category':
             handleDeleteCategory(el.dataset.catId);
             break;
-        case 'export':
-            exportData();
+        case 'toggle-reminders':
+            handleToggleReminders();
             break;
-        case 'import':
-            triggerImport();
+        case 'check-update':
+            checkForUpdate();
             break;
         case 'clear-all':
             handleClearAll();
@@ -614,6 +653,182 @@ function showToast(text) {
     toastTimer = setTimeout(() => toast.classList.add('hidden'), 1800);
 }
 
+// ===== Reminders =====
+let scheduledTimeouts = [];
+let alertedSet = new Set();
+let audioCtx = null;
+
+function loadAlerted() {
+    try {
+        const raw = localStorage.getItem(ALERTED_KEY);
+        if (raw) alertedSet = new Set(JSON.parse(raw));
+    } catch (e) {}
+    pruneAlertedSet();
+}
+
+function saveAlerted() {
+    localStorage.setItem(ALERTED_KEY, JSON.stringify(Array.from(alertedSet)));
+}
+
+function pruneAlertedSet() {
+    const cutoff = addDays(todayStr(), -7);
+    let changed = false;
+    for (const key of Array.from(alertedSet)) {
+        const date = key.split('__')[1];
+        if (date && date < cutoff) {
+            alertedSet.delete(key);
+            changed = true;
+        }
+    }
+    if (changed) saveAlerted();
+}
+
+function ensureAudioContext() {
+    try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        return audioCtx;
+    } catch (e) {
+        return null;
+    }
+}
+
+function playReminderSound() {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    // Three-tone ascending chime
+    [880, 1175, 1568].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = freq;
+        osc.type = 'sine';
+        const t = now + i * 0.15;
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.25, t + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+        osc.start(t);
+        osc.stop(t + 0.5);
+    });
+}
+
+async function requestNotificationPermission() {
+    if (!('Notification' in window)) return false;
+    if (Notification.permission === 'granted') return true;
+    if (Notification.permission === 'denied') return false;
+    try {
+        const res = await Notification.requestPermission();
+        return res === 'granted';
+    } catch (e) {
+        return false;
+    }
+}
+
+function showSystemNotification(occ) {
+    if (!('Notification' in window)) return;
+    if (Notification.permission !== 'granted') return;
+    const cat = getCategory(occ.categoryId);
+    try {
+        const n = new Notification(`⏰ ${occ.text}`, {
+            body: `🕘 ${occ.dueTime}${cat ? ' · ' + cat.name : ''}`,
+            icon: 'icons/icon-192.png',
+            badge: 'icons/icon-192.png',
+            tag: `${occ.taskId}__${occ.dueDate}`,
+            requireInteraction: false
+        });
+        n.onclick = () => { window.focus(); n.close(); };
+    } catch (e) {
+        console.warn('Notification failed', e);
+    }
+    if (navigator.vibrate) {
+        try { navigator.vibrate([200, 100, 200, 100, 400]); } catch (e) {}
+    }
+}
+
+function showReminderModal(occ) {
+    const cat = getCategory(occ.categoryId);
+    const html = `
+        <div class="modal-header">
+            <div class="modal-title">⏰ זמן למשימה!</div>
+            <button class="modal-close" onclick="closeModal()">✕</button>
+        </div>
+        <div style="text-align:center;padding:14px 8px 8px">
+            <div style="font-size:54px;margin-bottom:10px">⏰</div>
+            <div style="font-size:20px;font-weight:700;margin-bottom:8px;line-height:1.3">${escapeHtml(occ.text)}</div>
+            <div style="color:var(--text-muted);margin-bottom:8px">🕘 ${occ.dueTime}</div>
+            ${cat ? `<div><span class="task-category-tag" style="background:${cat.color}22;color:${cat.color};font-size:12px;padding:3px 10px"><span class="chip-dot" style="background:${cat.color}"></span>${escapeHtml(cat.name)}</span></div>` : ''}
+        </div>
+        <div class="btn-row">
+            <button class="btn btn-secondary" id="snooze-btn">דחה</button>
+            <button class="btn btn-primary" id="done-from-alert-btn">✓ סומן כבוצע</button>
+        </div>
+    `;
+    openModal(html);
+    const overlay = $('#modal-overlay');
+    overlay.querySelector('#snooze-btn').onclick = () => closeModal();
+    overlay.querySelector('#done-from-alert-btn').onclick = () => {
+        const task = state.tasks.find(t => t.id === occ.taskId);
+        if (task) {
+            const liveOcc = occurrenceFor(task, occ.dueDate);
+            setOccurrenceDone(liveOcc, true);
+        }
+        closeModal();
+        render();
+        showToast('✓ סומן כבוצע');
+    };
+}
+
+function scheduleReminders() {
+    scheduledTimeouts.forEach(t => clearTimeout(t));
+    scheduledTimeouts = [];
+
+    if (!state.settings || !state.settings.remindersEnabled) return;
+    if (!state.tasks) return;
+
+    const now = Date.now();
+    const today = todayStr();
+    const todayOccs = getOccurrencesOn(today).filter(o => !o.done);
+
+    for (const occ of todayOccs) {
+        const key = `${occ.taskId}__${occ.dueDate}`;
+        if (alertedSet.has(key)) continue;
+
+        const [h, m] = occ.dueTime.split(':').map(Number);
+        const target = new Date();
+        target.setHours(h, m, 0, 0);
+        const delay = target.getTime() - now;
+
+        if (delay < -60000) continue; // already > 1 min past
+        if (delay > REMINDER_SCHEDULE_WINDOW_MS) continue;
+
+        const taskId = occ.taskId;
+        const dateStr = occ.dueDate;
+        const id = setTimeout(() => triggerReminder(taskId, dateStr), Math.max(0, delay));
+        scheduledTimeouts.push(id);
+    }
+}
+
+function triggerReminder(taskId, dateStr) {
+    const key = `${taskId}__${dateStr}`;
+    if (alertedSet.has(key)) return;
+    if (!state.settings.remindersEnabled) return;
+
+    const task = state.tasks.find(t => t.id === taskId);
+    if (!task) return;
+    const occ = occurrenceFor(task, dateStr);
+    if (occ.done) return;
+    if (task.exceptions && task.exceptions.includes(dateStr)) return;
+
+    alertedSet.add(key);
+    saveAlerted();
+
+    playReminderSound();
+    showSystemNotification(occ);
+    showReminderModal(occ);
+}
+
 // ===== Modal helpers =====
 function openModal(html) {
     const overlay = $('#modal-overlay');
@@ -628,17 +843,28 @@ function closeModal() {
 }
 
 // ===== Task modal =====
-function openTaskModal(taskId) {
+// occurrenceDate (optional): if provided along with taskId, we're editing a single occurrence
+// of a recurring task — the original occurrence becomes an exception and a new one-off task is created.
+function openTaskModal(taskId, occurrenceDate) {
     const editing = !!taskId;
+    const editingOneOccurrence = !!occurrenceDate;
     const task = editing ? state.tasks.find(t => t.id === taskId) : null;
 
-    const defaultDate = task ? task.dueDate : todayStr();
+    const defaultDate = editingOneOccurrence ? occurrenceDate : (task ? task.dueDate : todayStr());
     const defaultTime = task ? task.dueTime : DEFAULT_TIME;
     const defaultCat = task ? task.categoryId : (state.categories[0]?.id || '');
     const defaultText = task ? task.text : '';
-    const recurring = task && task.recurrence;
+
+    const showRecurringSection = !editingOneOccurrence;
+    const recurring = !editingOneOccurrence && task && task.recurrence;
     const rType = recurring ? task.recurrence.type : 'daily';
-    const rWeekdays = recurring && task.recurrence.weekdays ? task.recurrence.weekdays : [];
+    const rWeekdays = (recurring && task.recurrence.weekdays) ? task.recurrence.weekdays : [];
+    const rCount = recurring ? (task.recurrence.count || DEFAULT_RECURRENCE_COUNT) : DEFAULT_RECURRENCE_COUNT;
+
+    const title = editingOneOccurrence ? 'ערוך מופע יחיד'
+        : (editing ? (task.recurrence ? 'ערוך את כל הסדרה' : 'ערוך משימה') : 'משימה חדשה');
+    const saveLabel = editingOneOccurrence ? 'שמור כמופע נפרד'
+        : (editing ? 'שמור' : 'הוסף משימה');
 
     const catOptions = state.categories.map(c =>
         `<option value="${c.id}" ${c.id === defaultCat ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
@@ -646,9 +872,15 @@ function openTaskModal(taskId) {
 
     const html = `
         <div class="modal-header">
-            <div class="modal-title">${editing ? 'ערוך משימה' : 'משימה חדשה'}</div>
+            <div class="modal-title">${title}</div>
             <button class="modal-close" onclick="closeModal()">✕</button>
         </div>
+
+        ${editingOneOccurrence ? `
+            <div style="background:var(--teal-bg);padding:10px 12px;border-radius:10px;margin-bottom:14px;font-size:13px;color:var(--teal-dark);line-height:1.4;">
+                ℹ️ עריכת המופע הזה תיצור משימה נפרדת ל-${prettyDate(occurrenceDate)} בלבד. שאר הסדרה לא תושפע.
+            </div>
+        ` : ''}
 
         <div class="form-group">
             <label class="form-label">מה צריך לעשות?</label>
@@ -682,6 +914,7 @@ function openTaskModal(taskId) {
             </div>
         </div>
 
+        ${showRecurringSection ? `
         <div class="form-group">
             <div class="toggle-row">
                 <label class="form-label" style="margin:0">🔁 משימה חוזרת</label>
@@ -698,20 +931,26 @@ function openTaskModal(taskId) {
                         <button type="button" class="weekday-btn ${rWeekdays.includes(i) ? 'active' : ''}" data-day="${i}">${lbl}</button>
                     `).join('')}
                 </div>
+                <div style="margin-top:12px">
+                    <label class="form-label">כמה פעמים להוסיף?</label>
+                    <input type="number" class="form-input" id="recurrence-count" value="${rCount}" min="1" max="${MAX_RECURRENCE_COUNT}">
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px">המופעים ייווצרו רק עד למספר זה.</div>
+                </div>
             </div>
         </div>
+        ` : ''}
 
         <div class="btn-row">
-            ${editing ? '<button class="btn btn-danger" id="delete-task-btn">מחק</button>' : ''}
-            <button class="btn btn-primary" id="save-task-btn">${editing ? 'שמור' : 'הוסף משימה'}</button>
+            ${editing && !editingOneOccurrence ? '<button class="btn btn-danger" id="delete-task-btn">מחק</button>' : ''}
+            <button class="btn btn-primary" id="save-task-btn">${saveLabel}</button>
         </div>
     `;
 
     openModal(html);
-    wireTaskModal(taskId);
+    wireTaskModal(taskId, occurrenceDate);
 }
 
-function wireTaskModal(taskId) {
+function wireTaskModal(taskId, occurrenceDate) {
     const overlay = $('#modal-overlay');
     let selectedColor = CATEGORY_COLORS[0];
     let newCatOpen = false;
@@ -737,70 +976,95 @@ function wireTaskModal(taskId) {
     });
 
     const recSwitch = overlay.querySelector('#recurring-switch');
-    recSwitch.onclick = () => {
-        recSwitch.classList.toggle('on');
-        overlay.querySelector('#recurrence-options').classList.toggle('hidden', !recSwitch.classList.contains('on'));
-    };
+    if (recSwitch) {
+        recSwitch.onclick = () => {
+            recSwitch.classList.toggle('on');
+            overlay.querySelector('#recurrence-options').classList.toggle('hidden', !recSwitch.classList.contains('on'));
+        };
+    }
 
     const recType = overlay.querySelector('#recurrence-type');
-    recType.onchange = () => {
-        overlay.querySelector('#weekdays-row').classList.toggle('hidden', recType.value !== 'weekly');
-    };
+    if (recType) {
+        recType.onchange = () => {
+            overlay.querySelector('#weekdays-row').classList.toggle('hidden', recType.value !== 'weekly');
+        };
+    }
 
     overlay.querySelectorAll('.weekday-btn').forEach(btn => {
         btn.onclick = () => btn.classList.toggle('active');
     });
 
     overlay.querySelector('#save-task-btn').onclick = () => {
-        saveTaskFromModal(taskId, newCatOpen ? selectedColor : null);
+        saveTaskFromModal(taskId, occurrenceDate, newCatOpen ? selectedColor : null);
     };
 
-    if (taskId) {
-        overlay.querySelector('#delete-task-btn').onclick = () => {
+    const delBtn = overlay.querySelector('#delete-task-btn');
+    if (delBtn) {
+        delBtn.onclick = () => {
             if (confirm('למחוק את המשימה?')) {
-                state.tasks = state.tasks.filter(t => t.id !== taskId);
-                // Also clean up its completions
-                Object.keys(state.completions).forEach(k => {
-                    if (k.startsWith(taskId + '__')) delete state.completions[k];
-                });
-                saveState();
-                closeModal();
-                render();
-                showToast('המשימה נמחקה');
+                deleteEntireTask(taskId);
             }
         };
     }
 }
 
-function saveTaskFromModal(taskId, newCatColor) {
+function saveTaskFromModal(taskId, occurrenceDate, newCatColor) {
     const overlay = $('#modal-overlay');
     const text = overlay.querySelector('#task-text').value.trim();
     const date = overlay.querySelector('#task-date').value;
     const time = overlay.querySelector('#task-time').value || DEFAULT_TIME;
     let catId = overlay.querySelector('#task-category').value;
     const newCatName = overlay.querySelector('#new-cat-name').value.trim();
-    const isRecurring = overlay.querySelector('#recurring-switch').classList.contains('on');
-    const recType = overlay.querySelector('#recurrence-type').value;
+
+    const recSwitch = overlay.querySelector('#recurring-switch');
+    const isRecurring = !!(recSwitch && recSwitch.classList.contains('on'));
+    const recTypeEl = overlay.querySelector('#recurrence-type');
+    const recType = recTypeEl ? recTypeEl.value : 'daily';
     const weekdays = Array.from(overlay.querySelectorAll('.weekday-btn.active')).map(b => parseInt(b.dataset.day));
+    const recCountEl = overlay.querySelector('#recurrence-count');
+    const recCount = recCountEl
+        ? Math.max(1, Math.min(MAX_RECURRENCE_COUNT, parseInt(recCountEl.value) || DEFAULT_RECURRENCE_COUNT))
+        : DEFAULT_RECURRENCE_COUNT;
 
     if (!text) { showToast('נא להזין טקסט למשימה'); return; }
     if (!date) { showToast('נא לבחור תאריך'); return; }
 
-    // Create new category if needed
     if (newCatName && newCatColor) {
         const newCat = { id: newId('cat'), name: newCatName, color: newCatColor };
         state.categories.push(newCat);
         catId = newCat.id;
     }
-
     if (!catId) { showToast('נא לבחור קטגוריה'); return; }
 
     let recurrence = null;
     if (isRecurring) {
-        recurrence = { type: recType };
+        recurrence = { type: recType, count: recCount };
         if (recType === 'weekly') {
             recurrence.weekdays = weekdays.length > 0 ? weekdays : [dayOfWeek(date)];
         }
+    }
+
+    // Edit-single-occurrence flow: add original date to exceptions and create a one-off task
+    if (taskId && occurrenceDate) {
+        const origTask = state.tasks.find(t => t.id === taskId);
+        if (origTask) {
+            if (!origTask.exceptions) origTask.exceptions = [];
+            if (!origTask.exceptions.includes(occurrenceDate)) {
+                origTask.exceptions.push(occurrenceDate);
+            }
+            delete state.completions[`${taskId}__${occurrenceDate}`];
+        }
+        state.tasks.push({
+            id: newId('task'),
+            text, categoryId: catId, dueDate: date, dueTime: time,
+            done: false, doneAt: null, recurrence: null, exceptions: [],
+            createdAt: new Date().toISOString()
+        });
+        saveState();
+        closeModal();
+        render();
+        showToast('המופע עודכן');
+        return;
     }
 
     if (taskId) {
@@ -810,11 +1074,12 @@ function saveTaskFromModal(taskId, newCatColor) {
         task.dueDate = date;
         task.dueTime = time;
         task.recurrence = recurrence;
+        if (!recurrence) task.exceptions = [];
     } else {
         state.tasks.push({
             id: newId('task'),
             text, categoryId: catId, dueDate: date, dueTime: time,
-            done: false, doneAt: null, recurrence,
+            done: false, doneAt: null, recurrence, exceptions: [],
             createdAt: new Date().toISOString()
         });
     }
@@ -828,32 +1093,82 @@ function saveTaskFromModal(taskId, newCatColor) {
 function openTaskMenu(taskId, dateStr) {
     const task = state.tasks.find(t => t.id === taskId);
     if (!task) return;
-    const html = `
+    const isRecurring = !!task.recurrence;
+
+    const header = `
         <div class="modal-header">
             <div class="modal-title">${escapeHtml(task.text)}</div>
             <button class="modal-close" onclick="closeModal()">✕</button>
         </div>
+        ${isRecurring ? `<div style="font-size:13px;color:var(--text-muted);padding:0 4px 10px">🔁 משימה חוזרת — ${prettyDate(dateStr)}</div>` : ''}
+    `;
+
+    const html = isRecurring ? header + `
+        <button class="action-sheet-item" data-action="edit-occurrence">✏️ ערוך רק את המופע הזה</button>
+        <button class="action-sheet-item" data-action="edit-series">✏️ ערוך את כל הסדרה</button>
+        <button class="action-sheet-item danger" data-action="delete-occurrence">🗑️ מחק רק את המופע הזה</button>
+        <button class="action-sheet-item danger" data-action="delete-series">🗑️ מחק את כל הסדרה</button>
+    ` : header + `
         <button class="action-sheet-item" data-action="edit-task">✏️ ערוך</button>
         <button class="action-sheet-item danger" data-action="delete-task">🗑️ מחק</button>
     `;
+
     openModal(html);
     const overlay = $('#modal-overlay');
-    overlay.querySelector('[data-action="edit-task"]').onclick = () => {
-        closeModal();
-        openTaskModal(taskId);
-    };
-    overlay.querySelector('[data-action="delete-task"]').onclick = () => {
-        if (confirm('למחוק את המשימה?' + (task.recurrence ? ' (כולל כל החזרות העתידיות)' : ''))) {
-            state.tasks = state.tasks.filter(t => t.id !== taskId);
-            Object.keys(state.completions).forEach(k => {
-                if (k.startsWith(taskId + '__')) delete state.completions[k];
-            });
-            saveState();
+
+    if (isRecurring) {
+        overlay.querySelector('[data-action="edit-occurrence"]').onclick = () => {
             closeModal();
-            render();
-            showToast('המשימה נמחקה');
-        }
-    };
+            openTaskModal(taskId, dateStr);
+        };
+        overlay.querySelector('[data-action="edit-series"]').onclick = () => {
+            closeModal();
+            openTaskModal(taskId);
+        };
+        overlay.querySelector('[data-action="delete-occurrence"]').onclick = () => {
+            if (confirm(`למחוק רק את המופע של ${prettyDate(dateStr)}?`)) {
+                deleteOccurrenceOnly(taskId, dateStr);
+            }
+        };
+        overlay.querySelector('[data-action="delete-series"]').onclick = () => {
+            if (confirm('למחוק את כל הסדרה? כל החזרות יימחקו.')) {
+                deleteEntireTask(taskId);
+            }
+        };
+    } else {
+        overlay.querySelector('[data-action="edit-task"]').onclick = () => {
+            closeModal();
+            openTaskModal(taskId);
+        };
+        overlay.querySelector('[data-action="delete-task"]').onclick = () => {
+            if (confirm('למחוק את המשימה?')) {
+                deleteEntireTask(taskId);
+            }
+        };
+    }
+}
+
+function deleteOccurrenceOnly(taskId, dateStr) {
+    const task = state.tasks.find(t => t.id === taskId);
+    if (!task) return;
+    if (!task.exceptions) task.exceptions = [];
+    if (!task.exceptions.includes(dateStr)) task.exceptions.push(dateStr);
+    delete state.completions[`${taskId}__${dateStr}`];
+    saveState();
+    closeModal();
+    render();
+    showToast('המופע נמחק');
+}
+
+function deleteEntireTask(taskId) {
+    state.tasks = state.tasks.filter(t => t.id !== taskId);
+    Object.keys(state.completions).forEach(k => {
+        if (k.startsWith(taskId + '__')) delete state.completions[k];
+    });
+    saveState();
+    closeModal();
+    render();
+    showToast('נמחק');
 }
 
 // ===== Category modal =====
@@ -920,48 +1235,91 @@ function handleDeleteCategory(catId) {
     showToast('נמחק');
 }
 
-// ===== Export / Import =====
-function exportData() {
-    const data = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        categories: state.categories,
-        tasks: state.tasks,
-        completions: state.completions
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `tasks-backup-${todayStr()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast('הקובץ הורד');
+// ===== Reminders toggle =====
+async function handleToggleReminders() {
+    if (!state.settings.remindersEnabled) {
+        // Turning ON — request permission if not already
+        const granted = await requestNotificationPermission();
+        state.settings.remindersEnabled = true;
+        saveState();
+        render();
+        if (granted) showToast('✓ תזכורות מופעלות');
+        else if ('Notification' in window && Notification.permission === 'denied') {
+            showToast('יש להפעיל התראות בהגדרות הדפדפן');
+        } else {
+            showToast('✓ תזכורות מופעלות (בתוך האפליקציה)');
+        }
+        ensureAudioContext();
+    } else {
+        state.settings.remindersEnabled = false;
+        scheduledTimeouts.forEach(t => clearTimeout(t));
+        scheduledTimeouts = [];
+        saveState();
+        render();
+        showToast('תזכורות כובו');
+    }
 }
 
-function triggerImport() {
-    const input = $('#import-file');
-    input.click();
-    input.onchange = (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-            try {
-                const data = JSON.parse(ev.target.result);
-                if (!confirm('פעולה זו תחליף את כל הנתונים הנוכחיים. להמשיך?')) return;
-                state.categories = data.categories || [];
-                state.tasks = data.tasks || [];
-                state.completions = data.completions || {};
-                saveState();
-                render();
-                showToast('הנתונים שוחזרו');
-            } catch (err) {
-                showToast('קובץ לא תקין');
-            }
-        };
-        reader.readAsText(file);
+// ===== Version update (with automatic snapshot backup) =====
+function snapshotBackup() {
+    const data = {
+        appVersion: APP_VERSION,
+        backedUpAt: new Date().toISOString(),
+        categories: state.categories,
+        tasks: state.tasks,
+        completions: state.completions,
+        settings: state.settings
     };
+    try {
+        localStorage.setItem(SAFETY_BACKUP_KEY, JSON.stringify(data));
+        return true;
+    } catch (e) {
+        console.warn('Snapshot failed', e);
+        return false;
+    }
+}
+
+async function checkForUpdate() {
+    snapshotBackup();
+    showToast('🔄 הנתונים גובו · בודק עדכון…');
+
+    if (!('serviceWorker' in navigator)) {
+        showToast('עדכון אוטומטי לא נתמך בדפדפן זה');
+        return;
+    }
+
+    try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (!reg) {
+            showToast('שירות לא רשום — רענני את הדף');
+            return;
+        }
+
+        let foundNew = false;
+        const onUpdateFound = () => {
+            foundNew = true;
+            const newSW = reg.installing || reg.waiting;
+            if (!newSW) return;
+            const handleState = () => {
+                if (newSW.state === 'installed') {
+                    showToast('✓ עדכון מוכן! טוען מחדש…');
+                    setTimeout(() => location.reload(), 1500);
+                }
+            };
+            newSW.addEventListener('statechange', handleState);
+            handleState();
+        };
+        reg.addEventListener('updatefound', onUpdateFound, { once: true });
+
+        await reg.update();
+
+        setTimeout(() => {
+            if (!foundNew) showToast('הגרסה שלך עדכנית ✓');
+        }, 3000);
+    } catch (e) {
+        console.error(e);
+        showToast('שגיאה בבדיקת עדכון');
+    }
 }
 
 function handleClearAll() {
@@ -970,7 +1328,7 @@ function handleClearAll() {
     state.categories = [...DEFAULT_CATEGORIES];
     state.tasks = [];
     state.completions = {};
-    state.ui.categoryFilter = 'all';
+    state.ui.categoryFilter = [];
     saveState();
     render();
     showToast('הכל נמחק');
@@ -999,4 +1357,22 @@ if ('serviceWorker' in navigator) {
 
 // ===== Init =====
 loadState();
+loadAlerted();
 render();
+scheduleReminders();
+
+// Re-check schedule every 2 minutes (catches drift, new tasks, etc.)
+setInterval(scheduleReminders, 2 * 60 * 1000);
+
+// Re-schedule when app comes back into focus
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+        pruneAlertedSet();
+        scheduleReminders();
+    }
+});
+
+// Prime AudioContext on first user gesture (browsers block autoplay otherwise)
+['click', 'touchstart'].forEach(evt => {
+    document.addEventListener(evt, () => ensureAudioContext(), { once: true });
+});
