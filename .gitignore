@@ -1,0 +1,13 @@
+# Local tooling
+.claude/
+.qodo/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
