@@ -303,19 +303,59 @@ input, select, textarea {
     font-weight: 600;
 }
 
-.task-menu-btn {
-    width: 28px;
-    height: 28px;
+.task-body {
+    cursor: pointer;
+    -webkit-tap-highlight-color: rgba(0, 153, 153, 0.08);
+}
+
+.task-delete-btn {
+    width: 30px;
+    height: 30px;
     border-radius: 50%;
     color: var(--text-light);
-    font-size: 18px;
+    font-size: 13px;
     line-height: 1;
     display: flex;
     align-items: center;
     justify-content: center;
+    transition: all var(--transition);
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin-top: -2px;
 }
 
-.task-menu-btn:hover { background: var(--bg); color: var(--text); }
+.task-delete-btn:hover,
+.task-delete-btn:active {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+/* Modal tabs (for recurring task edit: series vs occurrence) */
+.modal-tabs {
+    display: flex;
+    background: var(--bg);
+    border-radius: 10px;
+    padding: 4px;
+    margin-bottom: 16px;
+    gap: 4px;
+}
+
+.modal-tab {
+    flex: 1;
+    padding: 9px 6px;
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: transparent;
+    transition: all var(--transition);
+}
+
+.modal-tab.active {
+    background: var(--white);
+    color: var(--teal-dark);
+    box-shadow: var(--shadow-sm);
+}
 
 /* ===== Empty state ===== */
 .empty-state {

@@ -3,7 +3,7 @@
    ============================================================ */
 
 // ===== Constants =====
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.1';
 const STORAGE_KEY = 'taskmanager_v1';
 const ALERTED_KEY = 'taskmanager_alerted_v1';
 const SAFETY_BACKUP_KEY = 'taskmanager_safety_backup';
@@ -142,17 +142,22 @@ function recurrenceHits(task, dateStr) {
     return false;
 }
 
-// All actual occurrence dates for a task, honoring count limit and exceptions.
-function getTaskOccurrenceDates(task) {
+// All actual occurrence dates for a task. Honors endType: 'count' | 'until' | 'forever'.
+// latestDate caps the iteration (used for view-range queries; 'forever' depends on it).
+function getTaskOccurrenceDates(task, latestDate) {
     if (!task.recurrence) return [task.dueDate];
-    const maxOccurrences = task.recurrence.count || DEFAULT_RECURRENCE_COUNT;
+    const r = task.recurrence;
+    const endType = r.endType || 'count';
     const exceptions = new Set(task.exceptions || []);
+    const cap = latestDate || addDays(todayStr(), 365);
     const out = [];
     let date = task.dueDate;
     let matched = 0;
     let safety = 0;
-    while (matched < maxOccurrences && safety < 5000) {
+    while (safety < 10000 && date <= cap) {
         if (recurrenceHits(task, date)) {
+            if (endType === 'count' && matched >= (r.count || DEFAULT_RECURRENCE_COUNT)) break;
+            if (endType === 'until' && r.until && date > r.until) break;
             matched++;
             if (!exceptions.has(date)) out.push(date);
         }
@@ -197,7 +202,7 @@ function occurrenceFor(task, dateStr) {
 function getOccurrencesInRange(fromDate, toDate) {
     const out = [];
     for (const task of state.tasks) {
-        const dates = getTaskOccurrenceDates(task);
+        const dates = getTaskOccurrenceDates(task, toDate);
         for (const d of dates) {
             if (d >= fromDate && d <= toDate) {
                 out.push(occurrenceFor(task, d));
@@ -401,7 +406,8 @@ function renderTaskCard(occ, isToday, isOverdue) {
                  data-action="toggle-done"
                  data-task-id="${occ.taskId}"
                  data-date="${occ.dueDate}"></div>
-            <div class="task-body">
+            <div class="task-body" data-action="task-edit"
+                 data-task-id="${occ.taskId}" data-date="${occ.dueDate}">
                 <div class="task-text">${escapeHtml(occ.text)}</div>
                 <div class="task-meta">
                     <span class="task-time">🕘 ${occ.dueTime}</span>
@@ -411,7 +417,9 @@ function renderTaskCard(occ, isToday, isOverdue) {
                     ${recurring ? `<span class="task-recurring-badge">🔁 ${recurrenceLabel(taskRef.recurrence)}</span>` : ''}
                 </div>
             </div>
-            <button class="task-menu-btn" data-action="task-menu" data-task-id="${occ.taskId}" data-date="${occ.dueDate}">⋮</button>
+            <button class="task-delete-btn" data-action="task-delete"
+                    data-task-id="${occ.taskId}" data-date="${occ.dueDate}"
+                    aria-label="מחק">✕</button>
         </div>
     `;
 }
@@ -536,6 +544,13 @@ function renderSettingsView() {
             <div class="switch ${remindersOn ? 'on' : ''}" data-action="toggle-reminders"></div>
         </div>
 
+        <div class="settings-item" data-action="test-reminder">
+            <div class="settings-item-label">
+                <div class="settings-item-title">▶️ בדוק תזכורת עכשיו</div>
+                <div class="settings-item-desc">תזכורת בדיקה תיפתח בעוד 5 שניות (לוודא צליל + אישור)</div>
+            </div>
+        </div>
+
         <div class="settings-item" data-action="check-update">
             <div class="settings-item-label">
                 <div class="settings-item-title">🔄 עדכון גרסה</div>
@@ -610,8 +625,11 @@ function handleAppClick(e) {
         case 'add-task':
             openTaskModal();
             break;
-        case 'task-menu':
-            openTaskMenu(el.dataset.taskId, el.dataset.date);
+        case 'task-edit':
+            openTaskModal(el.dataset.taskId, el.dataset.date, true);
+            break;
+        case 'task-delete':
+            confirmDeleteTask(el.dataset.taskId, el.dataset.date);
             break;
         case 'add-category':
             openCategoryModal();
@@ -624,6 +642,9 @@ function handleAppClick(e) {
             break;
         case 'toggle-reminders':
             handleToggleReminders();
+            break;
+        case 'test-reminder':
+            testReminder();
             break;
         case 'check-update':
             checkForUpdate();
@@ -843,12 +864,15 @@ function closeModal() {
 }
 
 // ===== Task modal =====
-// occurrenceDate (optional): if provided along with taskId, we're editing a single occurrence
-// of a recurring task — the original occurrence becomes an exception and a new one-off task is created.
-function openTaskModal(taskId, occurrenceDate) {
+// taskId — task being edited (omit for new)
+// occurrenceDate — the date of the occurrence the user tapped (used by recurring tasks)
+// forceSeriesMode — true to edit the recurring series; false/undefined: edit one occurrence
+function openTaskModal(taskId, occurrenceDate, forceSeriesMode) {
     const editing = !!taskId;
-    const editingOneOccurrence = !!occurrenceDate;
     const task = editing ? state.tasks.find(t => t.id === taskId) : null;
+    const taskIsRecurring = !!(task && task.recurrence);
+    const editingOneOccurrence = !!occurrenceDate && !forceSeriesMode && taskIsRecurring;
+    const showTabs = editing && taskIsRecurring;
 
     const defaultDate = editingOneOccurrence ? occurrenceDate : (task ? task.dueDate : todayStr());
     const defaultTime = task ? task.dueTime : DEFAULT_TIME;
@@ -856,13 +880,15 @@ function openTaskModal(taskId, occurrenceDate) {
     const defaultText = task ? task.text : '';
 
     const showRecurringSection = !editingOneOccurrence;
-    const recurring = !editingOneOccurrence && task && task.recurrence;
+    const recurring = !editingOneOccurrence && taskIsRecurring;
     const rType = recurring ? task.recurrence.type : 'daily';
     const rWeekdays = (recurring && task.recurrence.weekdays) ? task.recurrence.weekdays : [];
     const rCount = recurring ? (task.recurrence.count || DEFAULT_RECURRENCE_COUNT) : DEFAULT_RECURRENCE_COUNT;
+    const rEndType = recurring ? (task.recurrence.endType || 'count') : 'count';
+    const rUntil = recurring ? (task.recurrence.until || addDays(todayStr(), 30)) : addDays(todayStr(), 30);
 
     const title = editingOneOccurrence ? 'ערוך מופע יחיד'
-        : (editing ? (task.recurrence ? 'ערוך את כל הסדרה' : 'ערוך משימה') : 'משימה חדשה');
+        : (editing ? (taskIsRecurring ? 'ערוך את כל הסדרה' : 'ערוך משימה') : 'משימה חדשה');
     const saveLabel = editingOneOccurrence ? 'שמור כמופע נפרד'
         : (editing ? 'שמור' : 'הוסף משימה');
 
@@ -875,6 +901,13 @@ function openTaskModal(taskId, occurrenceDate) {
             <div class="modal-title">${title}</div>
             <button class="modal-close" onclick="closeModal()">✕</button>
         </div>
+
+        ${showTabs ? `
+            <div class="modal-tabs">
+                <button class="modal-tab ${!editingOneOccurrence ? 'active' : ''}" data-mode-tab="series">ערוך את כל הסדרה</button>
+                <button class="modal-tab ${editingOneOccurrence ? 'active' : ''}" data-mode-tab="occurrence">ערוך רק מופע זה</button>
+            </div>
+        ` : ''}
 
         ${editingOneOccurrence ? `
             <div style="background:var(--teal-bg);padding:10px 12px;border-radius:10px;margin-bottom:14px;font-size:13px;color:var(--teal-dark);line-height:1.4;">
@@ -932,28 +965,43 @@ function openTaskModal(taskId, occurrenceDate) {
                     `).join('')}
                 </div>
                 <div style="margin-top:12px">
-                    <label class="form-label">כמה פעמים להוסיף?</label>
-                    <input type="number" class="form-input" id="recurrence-count" value="${rCount}" min="1" max="${MAX_RECURRENCE_COUNT}">
-                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px">המופעים ייווצרו רק עד למספר זה.</div>
+                    <label class="form-label">מתי לסיים?</label>
+                    <select class="form-select" id="recurrence-end-type">
+                        <option value="count" ${rEndType === 'count' ? 'selected' : ''}>אחרי מספר חזרות</option>
+                        <option value="until" ${rEndType === 'until' ? 'selected' : ''}>בתאריך מסוים</option>
+                        <option value="forever" ${rEndType === 'forever' ? 'selected' : ''}>לתמיד (ללא סוף)</option>
+                    </select>
+                    <div class="${rEndType === 'count' ? '' : 'hidden'}" id="end-count-block" style="margin-top:8px">
+                        <input type="number" class="form-input" id="recurrence-count" value="${rCount}" min="1" max="${MAX_RECURRENCE_COUNT}" placeholder="כמה פעמים">
+                    </div>
+                    <div class="${rEndType === 'until' ? '' : 'hidden'}" id="end-until-block" style="margin-top:8px">
+                        <input type="date" class="form-input" id="recurrence-until" value="${rUntil}">
+                    </div>
                 </div>
             </div>
         </div>
         ` : ''}
 
         <div class="btn-row">
-            ${editing && !editingOneOccurrence ? '<button class="btn btn-danger" id="delete-task-btn">מחק</button>' : ''}
             <button class="btn btn-primary" id="save-task-btn">${saveLabel}</button>
         </div>
     `;
 
     openModal(html);
-    wireTaskModal(taskId, occurrenceDate);
+    wireTaskModal(taskId, occurrenceDate, forceSeriesMode);
 }
 
-function wireTaskModal(taskId, occurrenceDate) {
+function wireTaskModal(taskId, occurrenceDate, forceSeriesMode) {
     const overlay = $('#modal-overlay');
     let selectedColor = CATEGORY_COLORS[0];
     let newCatOpen = false;
+
+    overlay.querySelectorAll('[data-mode-tab]').forEach(tab => {
+        tab.onclick = () => {
+            if (tab.dataset.modeTab === 'series') openTaskModal(taskId, occurrenceDate, true);
+            else openTaskModal(taskId, occurrenceDate, false);
+        };
+    });
 
     overlay.querySelector('#toggle-new-cat').onclick = () => {
         newCatOpen = !newCatOpen;
@@ -994,21 +1042,21 @@ function wireTaskModal(taskId, occurrenceDate) {
         btn.onclick = () => btn.classList.toggle('active');
     });
 
-    overlay.querySelector('#save-task-btn').onclick = () => {
-        saveTaskFromModal(taskId, occurrenceDate, newCatOpen ? selectedColor : null);
-    };
-
-    const delBtn = overlay.querySelector('#delete-task-btn');
-    if (delBtn) {
-        delBtn.onclick = () => {
-            if (confirm('למחוק את המשימה?')) {
-                deleteEntireTask(taskId);
-            }
+    const endTypeSelect = overlay.querySelector('#recurrence-end-type');
+    if (endTypeSelect) {
+        endTypeSelect.onchange = () => {
+            const v = endTypeSelect.value;
+            overlay.querySelector('#end-count-block').classList.toggle('hidden', v !== 'count');
+            overlay.querySelector('#end-until-block').classList.toggle('hidden', v !== 'until');
         };
     }
+
+    overlay.querySelector('#save-task-btn').onclick = () => {
+        saveTaskFromModal(taskId, occurrenceDate, forceSeriesMode, newCatOpen ? selectedColor : null);
+    };
 }
 
-function saveTaskFromModal(taskId, occurrenceDate, newCatColor) {
+function saveTaskFromModal(taskId, occurrenceDate, forceSeriesMode, newCatColor) {
     const overlay = $('#modal-overlay');
     const text = overlay.querySelector('#task-text').value.trim();
     const date = overlay.querySelector('#task-date').value;
@@ -1021,10 +1069,15 @@ function saveTaskFromModal(taskId, occurrenceDate, newCatColor) {
     const recTypeEl = overlay.querySelector('#recurrence-type');
     const recType = recTypeEl ? recTypeEl.value : 'daily';
     const weekdays = Array.from(overlay.querySelectorAll('.weekday-btn.active')).map(b => parseInt(b.dataset.day));
+
+    const endTypeEl = overlay.querySelector('#recurrence-end-type');
+    const endType = endTypeEl ? endTypeEl.value : 'count';
     const recCountEl = overlay.querySelector('#recurrence-count');
     const recCount = recCountEl
         ? Math.max(1, Math.min(MAX_RECURRENCE_COUNT, parseInt(recCountEl.value) || DEFAULT_RECURRENCE_COUNT))
         : DEFAULT_RECURRENCE_COUNT;
+    const recUntilEl = overlay.querySelector('#recurrence-until');
+    const recUntil = recUntilEl ? recUntilEl.value : null;
 
     if (!text) { showToast('נא להזין טקסט למשימה'); return; }
     if (!date) { showToast('נא לבחור תאריך'); return; }
@@ -1038,15 +1091,27 @@ function saveTaskFromModal(taskId, occurrenceDate, newCatColor) {
 
     let recurrence = null;
     if (isRecurring) {
-        recurrence = { type: recType, count: recCount };
+        recurrence = { type: recType, endType };
         if (recType === 'weekly') {
             recurrence.weekdays = weekdays.length > 0 ? weekdays : [dayOfWeek(date)];
         }
+        if (endType === 'count') {
+            recurrence.count = recCount;
+        } else if (endType === 'until') {
+            if (!recUntil) { showToast('נא לבחור תאריך סיום'); return; }
+            if (recUntil < date) { showToast('תאריך הסיום חייב להיות אחרי תאריך ההתחלה'); return; }
+            recurrence.until = recUntil;
+        }
+        // 'forever' has no extra fields
     }
 
-    // Edit-single-occurrence flow: add original date to exceptions and create a one-off task
-    if (taskId && occurrenceDate) {
-        const origTask = state.tasks.find(t => t.id === taskId);
+    // Determine mode for editing
+    const origTask = taskId ? state.tasks.find(t => t.id === taskId) : null;
+    const taskWasRecurring = !!(origTask && origTask.recurrence);
+    const editingOneOccurrence = !!occurrenceDate && !forceSeriesMode && taskWasRecurring;
+
+    if (editingOneOccurrence) {
+        // Mark original occurrence as exception + create new one-off task
         if (origTask) {
             if (!origTask.exceptions) origTask.exceptions = [];
             if (!origTask.exceptions.includes(occurrenceDate)) {
@@ -1089,63 +1154,37 @@ function saveTaskFromModal(taskId, occurrenceDate, newCatColor) {
     showToast(taskId ? 'עודכן' : 'נוסף');
 }
 
-// ===== Task menu (action sheet) =====
-function openTaskMenu(taskId, dateStr) {
+// ===== Delete confirmation (X button) =====
+function confirmDeleteTask(taskId, dateStr) {
     const task = state.tasks.find(t => t.id === taskId);
     if (!task) return;
-    const isRecurring = !!task.recurrence;
 
-    const header = `
+    if (!task.recurrence) {
+        if (confirm(`למחוק את "${task.text}"?`)) {
+            deleteEntireTask(taskId);
+        }
+        return;
+    }
+
+    const totalOccs = getTaskOccurrenceDates(task).length;
+    const html = `
         <div class="modal-header">
-            <div class="modal-title">${escapeHtml(task.text)}</div>
+            <div class="modal-title">מחיקת משימה</div>
             <button class="modal-close" onclick="closeModal()">✕</button>
         </div>
-        ${isRecurring ? `<div style="font-size:13px;color:var(--text-muted);padding:0 4px 10px">🔁 משימה חוזרת — ${prettyDate(dateStr)}</div>` : ''}
+        <div style="padding: 0 4px 14px">
+            <div style="font-weight: 600; margin-bottom: 4px">${escapeHtml(task.text)}</div>
+            <div style="color: var(--text-muted); font-size: 13px">🔁 משימה חוזרת · ${totalOccs} מופעים</div>
+        </div>
+        <button class="action-sheet-item danger" data-action="del-occ">🗑️ מחק רק את המופע של ${prettyDate(dateStr)}</button>
+        <button class="action-sheet-item danger" data-action="del-series">🗑️ מחק את כל הסדרה</button>
+        <button class="action-sheet-item" data-action="cancel">ביטול</button>
     `;
-
-    const html = isRecurring ? header + `
-        <button class="action-sheet-item" data-action="edit-occurrence">✏️ ערוך רק את המופע הזה</button>
-        <button class="action-sheet-item" data-action="edit-series">✏️ ערוך את כל הסדרה</button>
-        <button class="action-sheet-item danger" data-action="delete-occurrence">🗑️ מחק רק את המופע הזה</button>
-        <button class="action-sheet-item danger" data-action="delete-series">🗑️ מחק את כל הסדרה</button>
-    ` : header + `
-        <button class="action-sheet-item" data-action="edit-task">✏️ ערוך</button>
-        <button class="action-sheet-item danger" data-action="delete-task">🗑️ מחק</button>
-    `;
-
     openModal(html);
     const overlay = $('#modal-overlay');
-
-    if (isRecurring) {
-        overlay.querySelector('[data-action="edit-occurrence"]').onclick = () => {
-            closeModal();
-            openTaskModal(taskId, dateStr);
-        };
-        overlay.querySelector('[data-action="edit-series"]').onclick = () => {
-            closeModal();
-            openTaskModal(taskId);
-        };
-        overlay.querySelector('[data-action="delete-occurrence"]').onclick = () => {
-            if (confirm(`למחוק רק את המופע של ${prettyDate(dateStr)}?`)) {
-                deleteOccurrenceOnly(taskId, dateStr);
-            }
-        };
-        overlay.querySelector('[data-action="delete-series"]').onclick = () => {
-            if (confirm('למחוק את כל הסדרה? כל החזרות יימחקו.')) {
-                deleteEntireTask(taskId);
-            }
-        };
-    } else {
-        overlay.querySelector('[data-action="edit-task"]').onclick = () => {
-            closeModal();
-            openTaskModal(taskId);
-        };
-        overlay.querySelector('[data-action="delete-task"]').onclick = () => {
-            if (confirm('למחוק את המשימה?')) {
-                deleteEntireTask(taskId);
-            }
-        };
-    }
+    overlay.querySelector('[data-action="del-occ"]').onclick = () => deleteOccurrenceOnly(taskId, dateStr);
+    overlay.querySelector('[data-action="del-series"]').onclick = () => deleteEntireTask(taskId);
+    overlay.querySelector('[data-action="cancel"]').onclick = () => closeModal();
 }
 
 function deleteOccurrenceOnly(taskId, dateStr) {
@@ -1233,6 +1272,25 @@ function handleDeleteCategory(catId) {
     saveState();
     render();
     showToast('נמחק');
+}
+
+// ===== Test reminder (diagnostic) =====
+async function testReminder() {
+    await requestNotificationPermission();
+    ensureAudioContext();
+    showToast('תזכורת בדיקה בעוד 5 שניות…');
+    const testOcc = {
+        taskId: '__test__',
+        text: 'תזכורת בדיקה ✅',
+        dueDate: todayStr(),
+        dueTime: 'בדיקה',
+        categoryId: state.categories[0] ? state.categories[0].id : null
+    };
+    setTimeout(() => {
+        playReminderSound();
+        showSystemNotification(testOcc);
+        showReminderModal(testOcc);
+    }, 5000);
 }
 
 // ===== Reminders toggle =====
